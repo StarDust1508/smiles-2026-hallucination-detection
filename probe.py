@@ -1,31 +1,25 @@
 """
-probe.py — Hallucination probe classifier (v2: linear probe).
+probe.py — Hallucination probe classifier (v3: linear probe + improved features).
 
-The v1 MLP probe massively over-fit the small training set (train AUROC ~94%,
-test AUROC ~65%). v2 deliberately reduces capacity:
+Pipeline applied to the input feature vector:
 
-    raw features (~2690 dims)
-        → StandardScaler             (zero-mean, unit-variance per feature)
-        → PCA  (n_components=64)     (compress to a learnable subspace)
-        → LogisticRegression         (L2-penalised, class-balanced)
-        → tuned threshold            (max F1 on official validation slice)
+    raw features (~4560 dims: 5×896 mean-pool + ~80 geometric)
+        → VarianceThreshold        (remove near-constant features)
+        → StandardScaler           (zero-mean, unit-variance per feature)
+        → PCA  (n_components=128)  (compress to a learnable subspace)
+        → LogisticRegression       (L2-penalised, class-balanced)
+        → tuned threshold          (max F1 on official validation slice)
 
-Why a linear probe instead of an MLP:
+v3 changes vs v2:
+  - PCA 128 instead of 64 (richer features from mean-pool over response tokens)
+  - VarianceThreshold preprocessing (removes dead / near-constant features)
+  - C=1.0 (lighter regularisation — the new features carry more signal)
 
-  * With ~482 training samples per fold, any non-linear model with enough
-    capacity to fit the training set perfectly will memorise noise. The
-    "linear probe" is the standard tool in the interpretability literature
-    (Alain & Bengio 2016; Belinkov 2022) precisely because of this.
-  * scikit-learn's LogisticRegression is essentially zero-variance: it has a
-    convex objective, no random initialisation, and well-understood
-    regularisation behaviour.
-  * If a linear probe cannot extract the signal, an MLP almost certainly
-    cannot extract it from the same features either — the issue then lives
-    in the feature extraction stage, not in the classifier.
-
-Pipeline interface mirrors scikit-learn for compatibility with evaluate.py
-(``fit``, ``predict``, ``predict_proba``) plus the official
-``fit_hyperparameters`` hook for threshold tuning.
+Why a linear probe:
+  With ~482 training samples per fold and ~4560 raw features, any non-linear
+  model with enough capacity to fit the training set perfectly will memorise
+  noise. The "linear probe" is the standard tool in the interpretability
+  literature (Alain & Bengio 2016; Belinkov 2022) precisely because of this.
 """
 
 from __future__ import annotations
@@ -33,6 +27,7 @@ from __future__ import annotations
 import numpy as np
 import torch.nn as nn
 from sklearn.decomposition import PCA
+from sklearn.feature_selection import VarianceThreshold
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import f1_score
 from sklearn.preprocessing import StandardScaler
@@ -42,16 +37,19 @@ from sklearn.preprocessing import StandardScaler
 # Hyperparameters
 # ---------------------------------------------------------------------------
 
-PCA_COMPONENTS = 64
-# Inverse regularisation strength: smaller = stronger L2.  C=0.5 gave the best
-# average validation AUROC across folds in light manual sweep.
-LR_C = 0.5
-LR_MAX_ITER = 2000
+PCA_COMPONENTS = 128
+# Inverse regularisation strength. C=1.0 gave the best average validation
+# AUROC with the v3 feature set (mean-pool over response tokens).
+LR_C = 1.0
+LR_MAX_ITER = 3000
+# Minimum variance threshold: features with variance below this are removed.
+# Normalised to unit variance after scaling, so 0.01 = essentially constant.
+VAR_THRESHOLD = 0.01
 SEED = 42
 
 
 class HallucinationProbe(nn.Module):
-    """Linear probe: StandardScaler → PCA(64) → balanced LogisticRegression.
+    """Linear probe: VarianceThreshold → StandardScaler → PCA(128) → LogisticRegression.
 
     Subclasses ``nn.Module`` for compatibility with the evaluation pipeline,
     but contains no torch parameters — all learning is delegated to sklearn.
@@ -59,6 +57,7 @@ class HallucinationProbe(nn.Module):
 
     def __init__(self) -> None:
         super().__init__()
+        self._var_thresh: VarianceThreshold | None = None
         self._scaler = StandardScaler()
         self._pca: PCA | None = None
         self._clf: LogisticRegression | None = None
@@ -68,18 +67,20 @@ class HallucinationProbe(nn.Module):
     # Training
     # ------------------------------------------------------------------
     def fit(self, X: np.ndarray, y: np.ndarray) -> "HallucinationProbe":
-        """Fit scaler, PCA, and logistic regression."""
-        # 1. Standardise feature columns.
-        X_scaled = self._scaler.fit_transform(X)
+        """Fit variance threshold, scaler, PCA, and logistic regression."""
+        # 0. Remove near-constant features.
+        self._var_thresh = VarianceThreshold(threshold=VAR_THRESHOLD)
+        X_var = self._var_thresh.fit_transform(X)
 
-        # 2. PCA — n_components capped at min(64, n_samples-1, n_features).
+        # 1. Standardise feature columns.
+        X_scaled = self._scaler.fit_transform(X_var)
+
+        # 2. PCA — n_components capped at min(128, n_samples-1, n_features).
         n_components = min(PCA_COMPONENTS, X_scaled.shape[0] - 1, X_scaled.shape[1])
         self._pca = PCA(n_components=n_components, random_state=SEED)
         X_reduced = self._pca.fit_transform(X_scaled)
 
-        # 3. Class-balanced L2 logistic regression. ``class_weight='balanced'``
-        # automatically sets weights inversely proportional to class frequency,
-        # which matters because the dataset is ~70% positive (hallucinated).
+        # 3. Class-balanced L2 logistic regression.
         self._clf = LogisticRegression(
             C=LR_C,
             penalty="l2",
@@ -118,7 +119,8 @@ class HallucinationProbe(nn.Module):
     # Prediction
     # ------------------------------------------------------------------
     def _transform(self, X: np.ndarray) -> np.ndarray:
-        X_scaled = self._scaler.transform(X)
+        X_var = self._var_thresh.transform(X)
+        X_scaled = self._scaler.transform(X_var)
         return self._pca.transform(X_scaled) if self._pca is not None else X_scaled
 
     def predict(self, X: np.ndarray) -> np.ndarray:
@@ -131,9 +133,9 @@ class HallucinationProbe(nn.Module):
         return self._clf.predict_proba(X_reduced)
 
     # ------------------------------------------------------------------
-    # nn.Module compatibility shim — never actually called by evaluate.py.
+    # nn.Module compatibility shim
     # ------------------------------------------------------------------
     def forward(self, *_args, **_kwargs):  # pragma: no cover
         raise NotImplementedError(
-            "HallucinationProbe v2 is an sklearn pipeline; use predict_proba()."
+            "HallucinationProbe v3 is an sklearn pipeline; use predict_proba()."
         )
