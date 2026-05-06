@@ -1,25 +1,22 @@
 """
-probe.py — Hallucination probe classifier (v3: linear probe + improved features).
+probe.py — Hallucination probe classifier (v4: XGBoost + logits features).
 
 Pipeline applied to the input feature vector:
 
-    raw features (~4560 dims: 5×896 mean-pool + ~80 geometric)
+    raw features (~2700 dims: 3×896 hidden-state mean-pool + 10 logit confidence
+                   + 1 attention entropy)
         → VarianceThreshold        (remove near-constant features)
         → StandardScaler           (zero-mean, unit-variance per feature)
-        → PCA  (n_components=128)  (compress to a learnable subspace)
-        → LogisticRegression       (L2-penalised, class-balanced)
+        → XGBoost                  (max_depth=3, reg_alpha=1, reg_lambda=1)
         → tuned threshold          (max F1 on official validation slice)
 
-v3 changes vs v2:
-  - PCA 128 instead of 64 (richer features from mean-pool over response tokens)
-  - VarianceThreshold preprocessing (removes dead / near-constant features)
-  - C=1.0 (lighter regularisation — the new features carry more signal)
+Why XGBoost over LogisticRegression:
+  The v1-v3 experiments showed that linear probes barely beat the 70% baseline
+  accuracy, suggesting the hallucination signal is non-linear in feature space.
+  XGBoost with strong regularisation (max_depth≤3, L1+L2 penalties) captures
+  non-linear interactions without memorising the small training set (482 samples).
 
-Why a linear probe:
-  With ~482 training samples per fold and ~4560 raw features, any non-linear
-  model with enough capacity to fit the training set perfectly will memorise
-  noise. The "linear probe" is the standard tool in the interpretability
-  literature (Alain & Bengio 2016; Belinkov 2022) precisely because of this.
+  If xgboost is unavailable, the probe gracefully falls back to LogisticRegression.
 """
 
 from __future__ import annotations
@@ -32,64 +29,89 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import f1_score
 from sklearn.preprocessing import StandardScaler
 
+try:
+    from xgboost import XGBClassifier
+    HAS_XGBOOST = True
+except ImportError:
+    HAS_XGBOOST = False
+
 
 # ---------------------------------------------------------------------------
 # Hyperparameters
 # ---------------------------------------------------------------------------
 
-PCA_COMPONENTS = 128
-# Inverse regularisation strength. C=1.0 gave the best average validation
-# AUROC with the v3 feature set (mean-pool over response tokens).
+# XGBoost parameters — conservative to avoid overfitting on 482 samples.
+XGB_N_ESTIMATORS = 200
+XGB_MAX_DEPTH = 3
+XGB_LEARNING_RATE = 0.1
+XGB_REG_ALPHA = 1.0      # L1 regularisation
+XGB_REG_LAMBDA = 1.0     # L2 regularisation
+XGB_SUBSAMPLE = 0.8
+XGB_COLSAMPLE_BYTREE = 0.8
+
+# LogisticRegression fallback parameters.
 LR_C = 1.0
 LR_MAX_ITER = 3000
-# Minimum variance threshold: features with variance below this are removed.
-# Normalised to unit variance after scaling, so 0.01 = essentially constant.
-VAR_THRESHOLD = 0.01
+
+VARIANCE_THRESHOLD = 0.01
+PCA_COMPONENTS = 64
 SEED = 42
 
 
 class HallucinationProbe(nn.Module):
-    """Linear probe: VarianceThreshold → StandardScaler → PCA(128) → LogisticRegression.
+    """Classifier: VarianceThreshold → StandardScaler → XGBoost (or LogReg fallback).
 
     Subclasses ``nn.Module`` for compatibility with the evaluation pipeline,
-    but contains no torch parameters — all learning is delegated to sklearn.
+    but contains no torch parameters — all learning is delegated to sklearn/xgboost.
     """
 
     def __init__(self) -> None:
         super().__init__()
         self._var_thresh: VarianceThreshold | None = None
         self._scaler = StandardScaler()
-        self._pca: PCA | None = None
-        self._clf: LogisticRegression | None = None
+        self._clf: XGBClassifier | LogisticRegression | None = None
         self._threshold: float = 0.5
+        self._use_xgb = HAS_XGBOOST
 
     # ------------------------------------------------------------------
     # Training
     # ------------------------------------------------------------------
     def fit(self, X: np.ndarray, y: np.ndarray) -> "HallucinationProbe":
-        """Fit variance threshold, scaler, PCA, and logistic regression."""
+        """Fit variance threshold, scaler, and classifier."""
         # 0. Remove near-constant features.
-        self._var_thresh = VarianceThreshold(threshold=VAR_THRESHOLD)
+        self._var_thresh = VarianceThreshold(threshold=VARIANCE_THRESHOLD)
         X_var = self._var_thresh.fit_transform(X)
 
         # 1. Standardise feature columns.
         X_scaled = self._scaler.fit_transform(X_var)
 
-        # 2. PCA — n_components capped at min(128, n_samples-1, n_features).
-        n_components = min(PCA_COMPONENTS, X_scaled.shape[0] - 1, X_scaled.shape[1])
-        self._pca = PCA(n_components=n_components, random_state=SEED)
-        X_reduced = self._pca.fit_transform(X_scaled)
+        if self._use_xgb:
+            # 2a. XGBoost with strong regularisation.
+            self._clf = XGBClassifier(
+                n_estimators=XGB_N_ESTIMATORS,
+                max_depth=XGB_MAX_DEPTH,
+                learning_rate=XGB_LEARNING_RATE,
+                reg_alpha=XGB_REG_ALPHA,
+                reg_lambda=XGB_REG_LAMBDA,
+                subsample=XGB_SUBSAMPLE,
+                colsample_bytree=XGB_COLSAMPLE_BYTREE,
+                eval_metric="auc",
+                random_state=SEED,
+                verbosity=0,
+            )
+            self._clf.fit(X_scaled, y.astype(int))
+        else:
+            # 2b. LogisticRegression fallback.
+            self._clf = LogisticRegression(
+                C=LR_C,
+                penalty="l2",
+                class_weight="balanced",
+                solver="lbfgs",
+                max_iter=LR_MAX_ITER,
+                random_state=SEED,
+            )
+            self._clf.fit(X_scaled, y.astype(int))
 
-        # 3. Class-balanced L2 logistic regression.
-        self._clf = LogisticRegression(
-            C=LR_C,
-            penalty="l2",
-            class_weight="balanced",
-            solver="lbfgs",
-            max_iter=LR_MAX_ITER,
-            random_state=SEED,
-        )
-        self._clf.fit(X_reduced, y.astype(int))
         return self
 
     # ------------------------------------------------------------------
@@ -120,22 +142,21 @@ class HallucinationProbe(nn.Module):
     # ------------------------------------------------------------------
     def _transform(self, X: np.ndarray) -> np.ndarray:
         X_var = self._var_thresh.transform(X)
-        X_scaled = self._scaler.transform(X_var)
-        return self._pca.transform(X_scaled) if self._pca is not None else X_scaled
+        return self._scaler.transform(X_var)
 
     def predict(self, X: np.ndarray) -> np.ndarray:
         return (self.predict_proba(X)[:, 1] >= self._threshold).astype(int)
 
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
-        X_reduced = self._transform(X)
+        X_tf = self._transform(X)
         if self._clf is None:
             raise RuntimeError("Probe not fitted. Call fit() first.")
-        return self._clf.predict_proba(X_reduced)
+        return self._clf.predict_proba(X_tf)
 
     # ------------------------------------------------------------------
     # nn.Module compatibility shim
     # ------------------------------------------------------------------
     def forward(self, *_args, **_kwargs):  # pragma: no cover
         raise NotImplementedError(
-            "HallucinationProbe v3 is an sklearn pipeline; use predict_proba()."
+            "HallucinationProbe v4 delegates to sklearn/xgboost; use predict_proba()."
         )

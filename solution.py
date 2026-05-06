@@ -143,11 +143,21 @@ if __name__=='__main__':
 
         # ── 4. Aggregate each sample and store the compact feature vector ─────
         # The raw `hidden` tensor is released at the end of this loop iteration.
+        # Also extract logits for confidence-based features.
+        batch_logits = outputs.logits.float().cpu()  # (batch, seq_len, vocab_size)
+        batch_input_ids = input_ids.cpu()
+
         for i in range(hidden.size(0)):
+            # Shift logits: logits[t] predicts token[t+1], so we drop last logit
+            # and drop first input_id to align predictions with actual tokens.
+            sample_logits = batch_logits[i, :-1, :]  # (seq_len-1, vocab_size)
+            sample_input_ids = batch_input_ids[i, :]  # (seq_len,)
             feat = aggregation_and_feature_extraction(
-                hidden[i],   # (n_layers, seq_len, hidden_dim)
-                mask[i],     # (seq_len,)
+                hidden[i],               # (n_layers, seq_len, hidden_dim)
+                mask[i],                 # (seq_len,)
                 use_geometric=USE_GEOMETRIC,
+                logits=sample_logits,    # (seq_len-1, vocab_size)
+                input_ids=sample_input_ids,
             )
             all_features.append(feat.cpu())
 
@@ -204,9 +214,16 @@ if __name__=='__main__':
         hidden = torch.stack(outputs.hidden_states, dim=1).float()
         mask   = attention_mask.cpu()
 
+        batch_logits = outputs.logits.float().cpu()
+        batch_input_ids = input_ids.cpu()
+
         for i in range(hidden.size(0)):
+            sample_logits = batch_logits[i, :-1, :]
+            sample_input_ids = batch_input_ids[i, :]
             feat = aggregation_and_feature_extraction(
                 hidden[i], mask[i], use_geometric=USE_GEOMETRIC,
+                logits=sample_logits,
+                input_ids=sample_input_ids,
             )
             test_features.append(feat.cpu())
 
