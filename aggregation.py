@@ -144,7 +144,7 @@ def extract_geometric_features(
             layer_means[i + 1].unsqueeze(0),
             dim=-1,
         )  # (1,)
-        cos_sims.append(sim.squeeze(0))
+        cos_sims.append(sim)  # (1,)
 
     return torch.cat([seq_len_feat, mean_norms, token_vars] + cos_sims, dim=0)
 
