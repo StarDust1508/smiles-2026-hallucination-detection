@@ -234,13 +234,14 @@ def aggregation_and_feature_extraction(
           - 2699 if hidden states + logits (10 + 1 extra dims)
     """
     features: list[torch.Tensor] = [aggregate(hidden_states, attention_mask)]
+    device = hidden_states.device
 
     if logits is not None and input_ids is not None:
         logit_feats = extract_logit_features(logits, input_ids, attention_mask)
-        features.append(logit_feats)
+        features.append(logit_feats.to(device))
 
     if attentions is not None:
         attn_feats = extract_attention_entropy(attentions, attention_mask)
-        features.append(attn_feats)
+        features.append(attn_feats.to(device))
 
     return torch.cat(features, dim=0)
