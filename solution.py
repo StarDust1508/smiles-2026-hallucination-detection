@@ -109,6 +109,24 @@ if __name__=='__main__':
     model, tokenizer = get_model_and_tokenizer()
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+
+    # v7 needs cross-attention weights for the alignment features.  Qwen2.5
+    # defaults to SDPA attention, which does NOT support output_attentions=True.
+    # We therefore reload the same checkpoint with the "eager" attention
+    # implementation.  ~10 s overhead; everything else stays identical.
+    from transformers import AutoModelForCausalLM
+    import gc
+    del model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    model = AutoModelForCausalLM.from_pretrained(
+        "Qwen/Qwen2.5-0.5B",
+        output_hidden_states=True,
+        torch_dtype=torch.bfloat16,
+        attn_implementation="eager",
+    )
+    model.eval()
     model.to(device)
 
     all_features: list = []
