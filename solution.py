@@ -132,32 +132,31 @@ if __name__=='__main__':
         # ── 2. LLM forward pass ──────────────────────────────────────────────
         # outputs.hidden_states: tuple of (n_layers+1) tensors,
         # each with shape (batch, seq_len, hidden_dim).
-        # Index 0 → token embeddings; index k → transformer layer k.
+        # outputs.attentions:    tuple of n_layers tensors,
+        # each with shape (batch, n_heads, seq_len, seq_len).
         with torch.no_grad():
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+            outputs = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_attentions=True,   # v7 needs cross-attention grounding
+            )
 
-        # ── 3. Stack all layers into one tensor, move to CPU ─────────────────
-        # Shape: (batch, n_layers, seq_len, hidden_dim)
-        hidden = torch.stack(outputs.hidden_states, dim=1).float()
-        mask   = attention_mask.cpu()
-
-        # ── 4. Aggregate each sample and store the compact feature vector ─────
-        # The raw `hidden` tensor is released at the end of this loop iteration.
-        # Also extract logits for confidence-based features.
-        batch_logits = outputs.logits.float().cpu()  # (batch, seq_len, vocab_size)
+        # ── 3. Stack hidden states, keep only LAST layer attentions ──────────
+        hidden = torch.stack(outputs.hidden_states, dim=1).float()  # (B, L, T, D)
+        # Last layer attentions only — saves ~24× memory vs keeping all layers.
+        last_layer_attn = outputs.attentions[-1].float().cpu()      # (B, H, T, T)
+        mask = attention_mask.cpu()
         batch_input_ids = input_ids.cpu()
 
+        # ── 4. Aggregate each sample. v7 ignores logits; alignment features
+        #      use input_ids and the last-layer attention map.
         for i in range(hidden.size(0)):
-            # Shift logits: logits[t] predicts token[t+1], so we drop last logit
-            # and drop first input_id to align predictions with actual tokens.
-            sample_logits = batch_logits[i, :-1, :]  # (seq_len-1, vocab_size)
-            sample_input_ids = batch_input_ids[i, :]  # (seq_len,)
             feat = aggregation_and_feature_extraction(
-                hidden[i],               # (n_layers, seq_len, hidden_dim)
-                mask[i],                 # (seq_len,)
+                hidden[i],                                  # (L, T, D)
+                mask[i],                                    # (T,)
                 use_geometric=USE_GEOMETRIC,
-                logits=sample_logits,    # (seq_len-1, vocab_size)
-                input_ids=sample_input_ids,
+                input_ids=batch_input_ids[i, :],            # (T,)
+                last_layer_attentions=last_layer_attn[i],   # (H, T, T)
             )
             all_features.append(feat.cpu())
 
@@ -209,21 +208,22 @@ if __name__=='__main__':
         attention_mask = encoding["attention_mask"].to(device)
 
         with torch.no_grad():
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+            outputs = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_attentions=True,
+            )
 
         hidden = torch.stack(outputs.hidden_states, dim=1).float()
-        mask   = attention_mask.cpu()
-
-        batch_logits = outputs.logits.float().cpu()
+        last_layer_attn = outputs.attentions[-1].float().cpu()
+        mask = attention_mask.cpu()
         batch_input_ids = input_ids.cpu()
 
         for i in range(hidden.size(0)):
-            sample_logits = batch_logits[i, :-1, :]
-            sample_input_ids = batch_input_ids[i, :]
             feat = aggregation_and_feature_extraction(
                 hidden[i], mask[i], use_geometric=USE_GEOMETRIC,
-                logits=sample_logits,
-                input_ids=sample_input_ids,
+                input_ids=batch_input_ids[i, :],
+                last_layer_attentions=last_layer_attn[i],
             )
             test_features.append(feat.cpu())
 
